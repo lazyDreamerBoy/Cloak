@@ -2,7 +2,6 @@ package multiplex
 
 import (
 	"bytes"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -47,7 +46,7 @@ func TestDatagramBuffer_RW(t *testing.T) {
 				"got", b2,
 			)
 		}
-		if len(pipe.buf) != 0 {
+		if pipe.buf.Len() != 0 {
 			t.Error("buf len is not 0 after finished reading")
 			return
 		}
@@ -67,7 +66,7 @@ func TestDatagramBuffer_RW(t *testing.T) {
 			)
 			return
 		}
-		if atomic.LoadUint32(&pipe.closed) != 1 {
+		if !pipe.closed {
 			t.Error("expecting closed pipe, not closed")
 		}
 	})
@@ -77,7 +76,7 @@ func TestDatagramBuffer_BlockingRead(t *testing.T) {
 	pipe := NewDatagramBuffer()
 	b := []byte{0x01, 0x02, 0x03}
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		pipe.Write(Frame{Payload: b})
 	}()
 	b2 := make([]byte, len(b))

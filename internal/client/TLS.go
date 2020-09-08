@@ -1,13 +1,13 @@
 package client
 
 import (
-	"crypto/rand"
 	"encoding/binary"
-	"github.com/cbeuw/Cloak/internal/util"
-	"net"
-
+	"github.com/cbeuw/Cloak/internal/common"
 	log "github.com/sirupsen/logrus"
+	"net"
 )
+
+const appDataMaxLength = 16401
 
 type clientHelloFields struct {
 	random         []byte
@@ -45,7 +45,7 @@ func addExtRec(typ []byte, data []byte) []byte {
 	return ret
 }
 
-func unmarshalAuthenticationInfo(ai authenticationPayload, serverName string) (ret clientHelloFields) {
+func genStegClientHello(ai authenticationPayload, serverName string) (ret clientHelloFields) {
 	// random is marshalled ephemeral pub key 32 bytes
 	// The authentication ciphertext and its tag are then distributed among SessionId and X25519KeyShare
 	ret.random = ai.randPubKey[:]
@@ -56,48 +56,46 @@ func unmarshalAuthenticationInfo(ai authenticationPayload, serverName string) (r
 }
 
 type DirectTLS struct {
-	Transport
+	*common.TLSConn
+	browser browser
 }
 
-func (DirectTLS) HasRecordLayer() bool                              { return true }
-func (DirectTLS) UnitReadFunc() func(net.Conn, []byte) (int, error) { return util.ReadTLS }
-
-// PrepareConnection handles the TLS handshake for a given conn and returns the sessionKey
+// NewClientTransport handles the TLS handshake for a given conn and returns the sessionKey
 // if the server proceed with Cloak authentication
-func (DirectTLS) PrepareConnection(sta *State, conn net.Conn) (preparedConn net.Conn, sessionKey []byte, err error) {
-	preparedConn = conn
-	payload, sharedSecret := makeAuthenticationPayload(sta, rand.Reader)
-	chOnly := sta.browser.composeClientHello(unmarshalAuthenticationInfo(payload, sta.ServerName))
-	chWithRecordLayer := util.AddRecordLayer(chOnly, []byte{0x16}, []byte{0x03, 0x01})
-	_, err = preparedConn.Write(chWithRecordLayer)
+func (tls *DirectTLS) Handshake(rawConn net.Conn, authInfo AuthInfo) (sessionKey [32]byte, err error) {
+	payload, sharedSecret := makeAuthenticationPayload(authInfo)
+	chOnly := tls.browser.composeClientHello(genStegClientHello(payload, authInfo.MockDomain))
+	chWithRecordLayer := common.AddRecordLayer(chOnly, common.Handshake, common.VersionTLS11)
+	_, err = rawConn.Write(chWithRecordLayer)
 	if err != nil {
 		return
 	}
 	log.Trace("client hello sent successfully")
+	tls.TLSConn = &common.TLSConn{Conn: rawConn}
 
 	buf := make([]byte, 1024)
 	log.Trace("waiting for ServerHello")
-	_, err = util.ReadTLS(preparedConn, buf)
+	_, err = tls.Read(buf)
 	if err != nil {
 		return
 	}
 
-	encrypted := append(buf[11:43], buf[89:121]...)
+	encrypted := append(buf[6:38], buf[84:116]...)
 	nonce := encrypted[0:12]
 	ciphertextWithTag := encrypted[12:60]
-	sessionKey, err = util.AESGCMDecrypt(nonce, sharedSecret, ciphertextWithTag)
+	sessionKeySlice, err := common.AESGCMDecrypt(nonce, sharedSecret[:], ciphertextWithTag)
 	if err != nil {
 		return
 	}
+	copy(sessionKey[:], sessionKeySlice)
 
 	for i := 0; i < 2; i++ {
 		// ChangeCipherSpec and EncryptedCert (in the format of application data)
-		_, err = util.ReadTLS(preparedConn, buf)
+		_, err = tls.Read(buf)
 		if err != nil {
 			return
 		}
 	}
-
-	return preparedConn, sessionKey, nil
+	return sessionKey, nil
 
 }

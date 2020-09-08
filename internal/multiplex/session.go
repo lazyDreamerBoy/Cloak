@@ -3,7 +3,7 @@ package multiplex
 import (
 	"errors"
 	"fmt"
-	"github.com/cbeuw/Cloak/internal/util"
+	"github.com/cbeuw/Cloak/internal/common"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -14,39 +14,32 @@ import (
 
 const (
 	acceptBacklog = 1024
+	// TODO: will this be a signature?
+	defaultSendRecvBufSize = 20480
 )
 
 var ErrBrokenSession = errors.New("broken session")
 var errRepeatSessionClosing = errors.New("trying to close a closed session")
-
-// Obfuscator is responsible for the obfuscation and deobfuscation of frames
-type Obfuscator struct {
-	// Used in Stream.Write. Add multiplexing headers, encrypt and add TLS header
-	Obfs Obfser
-	// Remove TLS header, decrypt and unmarshall frames
-	Deobfs     Deobfser
-	SessionKey []byte
-}
+var errRepeatStreamClosing = errors.New("trying to close a closed stream")
 
 type switchboardStrategy int
 
 type SessionConfig struct {
-	NoRecordLayer bool
-
-	*Obfuscator
+	Obfuscator
 
 	Valve
 
-	// This is supposed to read one TLS message.
-	UnitRead func(net.Conn, []byte) (int, error)
-
 	Unordered bool
+
+	MaxFrameSize      int // maximum size of the frame, including the header
+	SendBufferSize    int
+	ReceiveBufferSize int
 }
 
 type Session struct {
 	id uint32
 
-	*SessionConfig
+	SessionConfig
 
 	// atomic
 	nextStreamID uint32
@@ -67,9 +60,11 @@ type Session struct {
 	closed uint32
 
 	terminalMsg atomic.Value
+
+	maxStreamUnitWrite int // the max size passed to Write calls before it splits it into multiple frames
 }
 
-func MakeSession(id uint32, config *SessionConfig) *Session {
+func MakeSession(id uint32, config SessionConfig) *Session {
 	sesh := &Session{
 		id:            id,
 		SessionConfig: config,
@@ -79,13 +74,25 @@ func MakeSession(id uint32, config *SessionConfig) *Session {
 	sesh.addrs.Store([]net.Addr{nil, nil})
 
 	if config.Valve == nil {
-		config.Valve = UNLIMITED_VALVE
+		sesh.Valve = UNLIMITED_VALVE
 	}
+	if config.SendBufferSize <= 0 {
+		sesh.SendBufferSize = defaultSendRecvBufSize
+	}
+	if config.ReceiveBufferSize <= 0 {
+		sesh.ReceiveBufferSize = defaultSendRecvBufSize
+	}
+	if config.MaxFrameSize <= 0 {
+		sesh.MaxFrameSize = defaultSendRecvBufSize - 1024
+	}
+	// todo: validation. this must be smaller than the buffer sizes
+	sesh.maxStreamUnitWrite = sesh.MaxFrameSize - HEADER_LEN - sesh.Obfuscator.minOverhead
 
-	sbConfig := &switchboardConfig{
-		Valve: config.Valve,
+	sbConfig := switchboardConfig{
+		valve:          sesh.Valve,
+		recvBufferSize: sesh.ReceiveBufferSize,
 	}
-	if config.Unordered {
+	if sesh.Unordered {
 		log.Debug("Connection is unordered")
 		sbConfig.strategy = UNIFORM_SPREAD
 	} else {
@@ -118,11 +125,7 @@ func (sesh *Session) OpenStream() (*Stream, error) {
 	}
 	id := atomic.AddUint32(&sesh.nextStreamID, 1) - 1
 	// Because atomic.AddUint32 returns the value after incrementation
-	connId, _, err := sesh.sb.pickRandConn()
-	if err != nil {
-		return nil, err
-	}
-	stream := makeStream(sesh, id, connId)
+	stream := makeStream(sesh, id)
 	sesh.streams.Store(id, stream)
 	sesh.streamCountIncr()
 	log.Tracef("stream %v of session %v opened", id, sesh.id)
@@ -142,37 +145,37 @@ func (sesh *Session) Accept() (net.Conn, error) {
 }
 
 func (sesh *Session) closeStream(s *Stream, active bool) error {
-	if s.isClosed() {
-		return errors.New("Already Closed")
+	if atomic.SwapUint32(&s.closed, 1) == 1 {
+		return fmt.Errorf("closing stream %v: %w", s.id, errRepeatStreamClosing)
 	}
-	atomic.StoreUint32(&s.closed, 1)
 	_ = s.recvBuf.Close() // both datagramBuffer and streamBuffer won't return err on Close()
 
 	if active {
-		s.writingM.Lock()
-		defer s.writingM.Unlock()
 		// Notify remote that this stream is closed
-		pad := genRandomPadding()
+		padding := genRandomPadding()
 		f := &Frame{
 			StreamID: s.id,
-			Seq:      atomic.AddUint64(&s.nextSendSeq, 1) - 1,
+			Seq:      s.nextSendSeq,
 			Closing:  C_STREAM,
-			Payload:  pad,
+			Payload:  padding,
 		}
-		i, err := s.session.Obfs(f, s.obfsBuf)
+		s.nextSendSeq++
+
+		obfsBuf := make([]byte, len(padding)+64)
+		i, err := sesh.Obfs(f, obfsBuf, 0)
 		if err != nil {
 			return err
 		}
-		_, err = s.session.sb.send(s.obfsBuf[:i], &s.assignedConnId)
+		_, err = sesh.sb.send(obfsBuf[:i], &s.assignedConnId)
 		if err != nil {
 			return err
 		}
-		log.Tracef("stream %v actively closed", s.id)
+		log.Tracef("stream %v actively closed. seq %v", s.id, f.Seq)
 	} else {
 		log.Tracef("stream %v passively closed", s.id)
 	}
 
-	sesh.streams.Store(s.id, nil)
+	sesh.streams.Store(s.id, nil) // id may or may not exist. if we use Delete(s.id) here it will panic
 	if sesh.streamCountDecr() == 0 {
 		log.Debugf("session %v has no active stream left", sesh.id)
 		go sesh.timeoutAfter(30 * time.Second)
@@ -194,9 +197,7 @@ func (sesh *Session) recvDataFromRemote(data []byte) error {
 		return sesh.passiveClose()
 	}
 
-	connId, _, _ := sesh.sb.pickRandConn()
-	// we ignore the error here. If the switchboard is broken, it will be reflected upon stream.Write
-	newStream := makeStream(sesh, frame.StreamID, connId)
+	newStream := makeStream(sesh, frame.StreamID)
 	existingStreamI, existing := sesh.streams.LoadOrStore(frame.StreamID, newStream)
 	if existing {
 		if existingStreamI == nil {
@@ -205,6 +206,7 @@ func (sesh *Session) recvDataFromRemote(data []byte) error {
 		}
 		return existingStreamI.(*Stream).writeFrame(*frame)
 	} else {
+		// new stream
 		sesh.streamCountIncr()
 		sesh.acceptCh <- newStream
 		return newStream.writeFrame(*frame)
@@ -251,9 +253,9 @@ func (sesh *Session) passiveClose() error {
 
 func genRandomPadding() []byte {
 	lenB := make([]byte, 1)
-	util.CryptoRandRead(lenB)
+	common.CryptoRandRead(lenB)
 	pad := make([]byte, lenB[0])
-	util.CryptoRandRead(pad)
+	common.CryptoRandRead(pad)
 	return pad
 }
 
@@ -285,7 +287,7 @@ func (sesh *Session) Close() error {
 		Payload:  pad,
 	}
 	obfsBuf := make([]byte, len(pad)+64)
-	i, err := sesh.Obfs(f, obfsBuf)
+	i, err := sesh.Obfs(f, obfsBuf, 0)
 	if err != nil {
 		return err
 	}

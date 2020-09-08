@@ -1,10 +1,9 @@
-package util
+package common
 
 import (
 	"errors"
 	"github.com/gorilla/websocket"
 	"io"
-	"net"
 	"sync"
 	"time"
 )
@@ -74,9 +73,4 @@ func (ws *WebSocketConn) SetDeadline(t time.Time) error {
 		return err
 	}
 	return nil
-}
-
-// ws unit reader
-func ReadWebSocket(conn net.Conn, buffer []byte) (n int, err error) {
-	return conn.Read(buffer)
 }

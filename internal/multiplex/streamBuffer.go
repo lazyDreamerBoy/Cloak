@@ -7,13 +7,15 @@ package multiplex
 // remote side before packet0. Cloak have to therefore sequence the packets so that they
 // arrive in order as they were sent by the proxy software
 //
-// Cloak packets will have a 32-bit sequence number on them, so we know in which order
+// Cloak packets will have a 64-bit sequence number on them, so we know in which order
 // they should be sent to the proxy software. The code in this file provides buffering and sorting.
 
 import (
 	"container/heap"
 	"fmt"
+	"io"
 	"sync"
+	"time"
 )
 
 type sorterHeap []*Frame
@@ -57,15 +59,12 @@ func NewStreamBuffer() *streamBuffer {
 	return sb
 }
 
-// recvNewFrame is a forever running loop which receives frames unordered,
-// cache and order them and send them into sortedBufCh
 func (sb *streamBuffer) Write(f Frame) (toBeClosed bool, err error) {
 	sb.recvM.Lock()
 	defer sb.recvM.Unlock()
 	// when there'fs no ooo packages in heap and we receive the next package in order
 	if len(sb.sh) == 0 && f.Seq == sb.nextRecvSeq {
 		if f.Closing != C_NOOP {
-			sb.buf.Close()
 			return true, nil
 		} else {
 			sb.buf.Write(f.Payload)
@@ -83,7 +82,6 @@ func (sb *streamBuffer) Write(f Frame) (toBeClosed bool, err error) {
 	for len(sb.sh) > 0 && sb.sh[0].Seq == sb.nextRecvSeq {
 		f = *heap.Pop(&sb.sh).(*Frame)
 		if f.Closing != C_NOOP {
-			sb.buf.Close()
 			return true, nil
 		} else {
 			sb.buf.Write(f.Payload)
@@ -97,6 +95,16 @@ func (sb *streamBuffer) Read(buf []byte) (int, error) {
 	return sb.buf.Read(buf)
 }
 
+func (sb *streamBuffer) WriteTo(w io.Writer) (int64, error) {
+	return sb.buf.WriteTo(w)
+}
+
 func (sb *streamBuffer) Close() error {
+	sb.recvM.Lock()
+	defer sb.recvM.Unlock()
+
 	return sb.buf.Close()
 }
+
+func (sb *streamBuffer) SetReadDeadline(t time.Time)       { sb.buf.SetReadDeadline(t) }
+func (sb *streamBuffer) SetWriteToTimeout(d time.Duration) { sb.buf.SetWriteToTimeout(d) }

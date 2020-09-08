@@ -3,29 +3,32 @@ package server
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"github.com/cbeuw/Cloak/internal/common"
 	mux "github.com/cbeuw/Cloak/internal/multiplex"
 	"github.com/cbeuw/Cloak/internal/server/usermanager"
-	"github.com/cbeuw/Cloak/internal/util"
+	"io/ioutil"
 	"os"
 	"testing"
 )
 
-func getSeshConfig(unordered bool) *mux.SessionConfig {
-	sessionKey := make([]byte, 32)
-	rand.Read(sessionKey)
-	obfuscator, _ := mux.GenerateObfs(0x00, sessionKey, true)
+func getSeshConfig(unordered bool) mux.SessionConfig {
+	var sessionKey [32]byte
+	rand.Read(sessionKey[:])
+	obfuscator, _ := mux.MakeObfuscator(0x00, sessionKey)
 
-	seshConfig := &mux.SessionConfig{
+	seshConfig := mux.SessionConfig{
 		Obfuscator: obfuscator,
 		Valve:      nil,
-		UnitRead:   util.ReadTLS,
 		Unordered:  unordered,
 	}
 	return seshConfig
 }
 
 func TestActiveUser_Bypass(t *testing.T) {
-	manager, err := usermanager.MakeLocalManager(MOCK_DB_NAME)
+	var tmpDB, _ = ioutil.TempFile("", "ck_user_info")
+	defer os.Remove(tmpDB.Name())
+
+	manager, err := usermanager.MakeLocalManager(tmpDB.Name(), common.RealWorldState)
 	if err != nil {
 		t.Fatal("failed to make local manager", err)
 	}
@@ -49,7 +52,7 @@ func TestActiveUser_Bypass(t *testing.T) {
 	}
 
 	// get first session again
-	seshx, existing, err := user.GetSession(0, &mux.SessionConfig{})
+	seshx, existing, err := user.GetSession(0, mux.SessionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,9 +118,5 @@ func TestActiveUser_Bypass(t *testing.T) {
 	err = manager.Close()
 	if err != nil {
 		t.Fatal("failed to close localmanager", err)
-	}
-	err = os.Remove(MOCK_DB_NAME)
-	if err != nil {
-		t.Fatal("failed to delete mockdb", err)
 	}
 }

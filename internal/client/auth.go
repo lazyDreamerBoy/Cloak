@@ -2,10 +2,8 @@ package client
 
 import (
 	"encoding/binary"
+	"github.com/cbeuw/Cloak/internal/common"
 	"github.com/cbeuw/Cloak/internal/ecdh"
-	"github.com/cbeuw/Cloak/internal/util"
-	"io"
-	"sync/atomic"
 )
 
 const (
@@ -19,7 +17,7 @@ type authenticationPayload struct {
 
 // makeAuthenticationPayload generates the ephemeral key pair, calculates the shared secret, and then compose and
 // encrypt the authenticationPayload
-func makeAuthenticationPayload(sta *State, randReader io.Reader) (ret authenticationPayload, sharedSecret []byte) {
+func makeAuthenticationPayload(authInfo AuthInfo) (ret authenticationPayload, sharedSecret [32]byte) {
 	/*
 		Authentication data:
 		+----------+----------------+---------------------+-------------+--------------+--------+------------+
@@ -28,22 +26,22 @@ func makeAuthenticationPayload(sta *State, randReader io.Reader) (ret authentica
 		| 16 bytes | 12 bytes       | 1 byte              | 8 bytes     | 4 bytes      | 1 byte | 6 bytes    |
 		+----------+----------------+---------------------+-------------+--------------+--------+------------+
 	*/
-	ephPv, ephPub, _ := ecdh.GenerateKey(randReader)
+	ephPv, ephPub, _ := ecdh.GenerateKey(authInfo.WorldState.Rand)
 	copy(ret.randPubKey[:], ecdh.Marshal(ephPub))
 
 	plaintext := make([]byte, 48)
-	copy(plaintext, sta.UID)
-	copy(plaintext[16:28], sta.ProxyMethod)
-	plaintext[28] = sta.EncryptionMethod
-	binary.BigEndian.PutUint64(plaintext[29:37], uint64(sta.Now().Unix()))
-	binary.BigEndian.PutUint32(plaintext[37:41], atomic.LoadUint32(&sta.SessionID))
+	copy(plaintext, authInfo.UID)
+	copy(plaintext[16:28], authInfo.ProxyMethod)
+	plaintext[28] = authInfo.EncryptionMethod
+	binary.BigEndian.PutUint64(plaintext[29:37], uint64(authInfo.WorldState.Now().Unix()))
+	binary.BigEndian.PutUint32(plaintext[37:41], authInfo.SessionId)
 
-	if sta.Unordered {
+	if authInfo.Unordered {
 		plaintext[41] |= UNORDERED_FLAG
 	}
 
-	sharedSecret = ecdh.GenerateSharedSecret(ephPv, sta.staticPub)
-	ciphertextWithTag, _ := util.AESGCMEncrypt(ret.randPubKey[:12], sharedSecret, plaintext)
+	copy(sharedSecret[:], ecdh.GenerateSharedSecret(ephPv, authInfo.ServerPubKey))
+	ciphertextWithTag, _ := common.AESGCMEncrypt(ret.randPubKey[:12], sharedSecret[:], plaintext)
 	copy(ret.ciphertextWithTag[:], ciphertextWithTag[:])
 	return
 }
